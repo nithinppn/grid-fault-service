@@ -59,6 +59,8 @@ def extract(x: np.ndarray) -> np.ndarray:
         ],
         axis=1,
     )
-    feats = np.concatenate([rms_last, rms_ratio, amax_ratio, mean_last, v_seq, i_seq, ratios], axis=1)
+    feats = np.concatenate(
+        [rms_last, rms_ratio, amax_ratio, mean_last, v_seq, i_seq, ratios], axis=1
+    )
     assert feats.shape[1] == len(FEATURE_NAMES)
     return feats.astype(np.float32)
