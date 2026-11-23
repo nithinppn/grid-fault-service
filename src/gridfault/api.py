@@ -18,7 +18,9 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field, field_validator
 
 from .drift import REFERENCE_PATH, DriftMonitor, load_reference
+from .explain import GroundingError, WindowContext, generate_report
 from .features import extract
+from .llm import make_llm
 from .model import MODEL_PATH, load_model
 from .simulate import CHANNELS, CLASSES, WINDOW
 
@@ -62,6 +64,24 @@ class HealthResponse(BaseModel):
     classes: list[str]
 
 
+class Evidence(BaseModel):
+    feature: str
+    value: float
+    normal_median: float
+
+
+class ExplainResponse(BaseModel):
+    fault_type: str
+    fault_detected: bool
+    confidence: float
+    summary: str
+    evidence: list[Evidence]
+    drift_note: str
+    recommended_checks: list[str]
+    model: str
+    grounding_checked: bool
+
+
 class DriftedFeature(BaseModel):
     feature: str
     psi: float
@@ -101,10 +121,15 @@ async def lifespan(app: FastAPI):
         log.info("loaded drift reference from %s", ref_path)
     else:
         log.warning("no drift reference at %s; /drift will return 503", ref_path)
+    app.state.llm = make_llm()
+    if app.state.llm is None:
+        log.warning("no ANTHROPIC_API_KEY or GROQ_API_KEY; /explain will return 503")
+    else:
+        log.info("operator reports via %s (%s)", app.state.llm.provider, app.state.llm.model)
     yield
 
 
-app = FastAPI(title="grid-fault-service", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="grid-fault-service", version="0.4.0", lifespan=lifespan)
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -117,14 +142,17 @@ def health(request: Request, response: Response) -> HealthResponse:
     )
 
 
+def _score(clf, req: PredictRequest) -> tuple[np.ndarray, np.ndarray]:
+    feats = extract(np.asarray(req.window, dtype=np.float32)[None])
+    return feats, clf.predict_proba(feats)[0]
+
+
 @app.post("/predict", response_model=PredictResponse)
 def predict(req: PredictRequest, request: Request) -> PredictResponse:
     clf = request.app.state.model
     if clf is None:
         raise HTTPException(status_code=503, detail="model not loaded")
-    x = np.asarray(req.window, dtype=np.float32)[None]
-    feats = extract(x)
-    proba = clf.predict_proba(feats)[0]
+    feats, proba = _score(clf, req)
     names = [CLASSES[int(c)] for c in clf.classes_]
     best = int(np.argmax(proba))
     monitor = request.app.state.monitor
@@ -156,3 +184,36 @@ def drift_reset(request: Request) -> dict[str, str]:
     """Clear the buffered windows (e.g. after a recalibration or between demo phases)."""
     _monitor(request).reset()
     return {"status": "reset"}
+
+
+@app.post("/explain", response_model=ExplainResponse)
+def explain(req: PredictRequest, request: Request) -> dict:
+    """Plain-language fault report for an operator, grounded in this service's own outputs.
+
+    The window is scored again here rather than trusting a prediction sent by the client,
+    and it is not added to the drift buffer, so calling /predict and then /explain on the
+    same window does not count it twice.
+    """
+    clf = request.app.state.model
+    monitor = request.app.state.monitor
+    llm = request.app.state.llm
+    if clf is None or monitor is None:
+        raise HTTPException(status_code=503, detail="model or drift reference not loaded")
+    if llm is None:
+        raise HTTPException(
+            status_code=503, detail="no LLM configured: set ANTHROPIC_API_KEY or GROQ_API_KEY"
+        )
+    feats, proba = _score(clf, req)
+    ctx = WindowContext(
+        features=feats[0],
+        proba=proba,
+        class_indices=[int(c) for c in clf.classes_],
+        monitor=monitor,
+    )
+    try:
+        return generate_report(llm.client, ctx, model=llm.model)
+    except GroundingError as e:
+        log.warning("rejected ungrounded report: %s", e)
+        raise HTTPException(
+            status_code=502, detail=f"report failed the grounding check: {e}"
+        ) from e
