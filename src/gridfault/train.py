@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
 
+from .drift import REFERENCE_PATH, save_reference
 from .features import extract
 from .model import MODEL_PATH, ROOT, fit_classifier, save_model
 from .simulate import CLASSES, make_dataset
@@ -82,6 +83,7 @@ def main() -> None:
     clf = fit_classifier(f_tr, y_tr, args.max_iter, args.learning_rate, args.seed)
     saved = save_model(clf, MODEL_PATH)
     print(f"saved model to {saved}")
+    print(f"saved drift reference to {save_reference(REFERENCE_PATH, f_tr, y_tr)}")
 
     metrics = {}
     for name, f, y in (("val", f_va, y_va), ("test", f_te, y_te), ("ood", f_ood, y_ood)):

@@ -5,21 +5,36 @@ import pytest
 from fastapi.testclient import TestClient
 
 from gridfault.api import app
+from gridfault.drift import save_reference
 from gridfault.features import extract
 from gridfault.model import fit_classifier, save_model
 from gridfault.simulate import CLASSES, WINDOW, make_dataset, simulate_window
 
 
 @pytest.fixture(scope="module")
-def model_path(tmp_path_factory):
+def artifacts(tmp_path_factory):
+    d = tmp_path_factory.mktemp("artifacts")
     x, y = make_dataset(150, seed=1)
-    clf = fit_classifier(extract(x), y, max_iter=60)
-    return save_model(clf, tmp_path_factory.mktemp("model") / "model.joblib")
+    feats = extract(x)
+    clf = fit_classifier(feats, y, max_iter=60)
+    return {
+        "model": save_model(clf, d / "model.joblib"),
+        "reference": save_reference(d / "reference.npz", feats, y),
+    }
 
 
 @pytest.fixture()
-def client(model_path, monkeypatch):
-    monkeypatch.setenv("GRIDFAULT_MODEL_PATH", str(model_path))
+def client(artifacts, monkeypatch):
+    monkeypatch.setenv("GRIDFAULT_MODEL_PATH", str(artifacts["model"]))
+    monkeypatch.setenv("GRIDFAULT_REFERENCE_PATH", str(artifacts["reference"]))
+    with TestClient(app) as c:
+        yield c
+
+
+@pytest.fixture()
+def client_no_reference(artifacts, tmp_path, monkeypatch):
+    monkeypatch.setenv("GRIDFAULT_MODEL_PATH", str(artifacts["model"]))
+    monkeypatch.setenv("GRIDFAULT_REFERENCE_PATH", str(tmp_path / "missing.npz"))
     with TestClient(app) as c:
         yield c
 
@@ -27,6 +42,7 @@ def client(model_path, monkeypatch):
 @pytest.fixture()
 def client_no_model(tmp_path, monkeypatch):
     monkeypatch.setenv("GRIDFAULT_MODEL_PATH", str(tmp_path / "missing.joblib"))
+    monkeypatch.setenv("GRIDFAULT_REFERENCE_PATH", str(tmp_path / "missing.npz"))
     with TestClient(app) as c:
         yield c
 
@@ -101,3 +117,40 @@ def test_no_model_gives_503(client_no_model):
     assert client_no_model.get("/health").status_code == 503
     assert client_no_model.get("/health").json()["model_loaded"] is False
     assert client_no_model.post("/predict", json=_body("AG")).status_code == 503
+
+
+def test_drift_starts_empty(client):
+    r = client.get("/drift")
+    assert r.status_code == 200
+    out = r.json()
+    assert out["status"] == "insufficient_data"
+    assert out["drift_detected"] is False
+    assert out["n_buffered"] == 0
+
+
+def test_predict_feeds_the_drift_buffer(client):
+    for seed in range(3):
+        assert client.post("/predict", json=_body("AG", seed)).status_code == 200
+    out = client.get("/drift").json()
+    assert out["n_buffered"] == 3
+    assert out["classes"]["AG"]["n"] == 3
+    assert out["classes"]["AG"]["evaluated"] is False  # far below the minimum sample size
+
+
+def test_drift_reset_clears_buffer(client):
+    client.post("/predict", json=_body("AG"))
+    assert client.post("/drift/reset").json() == {"status": "reset"}
+    assert client.get("/drift").json()["n_buffered"] == 0
+
+
+def test_rejected_requests_do_not_enter_the_drift_buffer(client):
+    body = _body("AG")
+    body["window"] = body["window"][:5]
+    assert client.post("/predict", json=body).status_code == 422
+    assert client.get("/drift").json()["n_buffered"] == 0
+
+
+def test_missing_reference_disables_drift_but_not_predict(client_no_reference):
+    assert client_no_reference.post("/predict", json=_body("AG")).status_code == 200
+    assert client_no_reference.get("/drift").status_code == 503
+    assert client_no_reference.post("/drift/reset").status_code == 503
