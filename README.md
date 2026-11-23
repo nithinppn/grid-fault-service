@@ -10,12 +10,12 @@ It covers the whole loop on one problem: data generation, feature engineering, e
 
 ```mermaid
 flowchart LR
-    A[Simulator<br/>3-phase windows] --> B[Features<br/>phasors, sequence components]
-    B --> C[Train<br/>HistGradientBoosting + MLflow]
-    C --> D[(model.joblib<br/>reference.npz)]
-    D --> E[FastAPI<br/>/predict /health]
-    E --> F[Drift monitor<br/>per predicted class]
-    F --> G[/drift]
+    A["Simulator<br/>3-phase windows"] --> B["Features<br/>phasors, sequence components"]
+    B --> C["Train<br/>HistGradientBoosting + MLflow"]
+    C --> D[("model.joblib<br/>reference.npz")]
+    D --> E["FastAPI<br/>predict, health"]
+    E --> F["Drift monitor<br/>per predicted class"]
+    F --> G["GET drift"]
 ```
 
 ## Results
